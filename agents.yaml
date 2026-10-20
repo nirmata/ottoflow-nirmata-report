@@ -1,0 +1,121 @@
+---
+# Agent 1: Calls the Nirmata REST API to fetch cluster list + NKC versions.
+# Returns a JSON object: { "clusters": [...], "total": N }
+apiVersion: ottoflow.nirmata.io/v1alpha1
+kind: Agent
+metadata:
+  name: nirmata-cluster-fetch-agent
+  namespace: ottoflow
+spec:
+  modelProvider: anthropic
+  prompt: |
+    You are a Nirmata platform API expert. Your only job is to call the Nirmata
+    REST API and return structured JSON data about the registered clusters.
+
+    When given a Nirmata URL, API key, and optional proxy, make a GET request to:
+      https://<url>/nirmata/api/cluster/api/Cluster
+
+    with the header:
+      Authorization: NIRMATA-API <apiKey>
+
+    For each cluster in the response, extract:
+      - name       (.name)
+      - k8sVersion (.kubernetesVersion or .k8sVersion or .serverVersion)
+      - nkcVersion (.nirmataControllerVersion or .agentVersion or .controllerVersion or .nkc_version)
+      - state      (.state or .status)
+
+    Return ONLY valid JSON in this exact shape — no explanation, no markdown:
+    {
+      "clusters": [
+        {"name": "...", "k8sVersion": "...", "nkcVersion": "...", "state": "..."}
+      ],
+      "total": <count>
+    }
+
+    If a field is missing, use "N/A". If the API call fails, return:
+    {"clusters": [], "total": 0, "error": "<reason>"}
+
+---
+# Agent 1b: Queries MongoDB replica set status via a temporary pod
+# using the same image as the running MongoDB StatefulSet.
+apiVersion: ottoflow.nirmata.io/v1alpha1
+kind: Agent
+metadata:
+  name: nirmata-mongo-rs-agent
+  namespace: ottoflow
+spec:
+  modelProvider: anthropic
+  prompt: |
+    You are a Kubernetes and MongoDB operations expert.
+
+    When given a MongoDB service hostname, port, namespace, and the MongoDB
+    image currently running in the cluster, spin up a temporary Kubernetes pod
+    using that exact image and run the following MongoDB query against the admin
+    database to get the replica set status:
+
+      db.getSiblingDB("admin").runCommand({replSetGetStatus: 1})
+
+    Use kubectl run with --rm --restart=Never so the pod self-deletes.
+    Use the same image as the running MongoDB StatefulSet (never pull a different image).
+
+    Extract from the result:
+      - set      : the replica set name (rs.set)
+      - members  : array of { name, stateStr, health (1=OK/0=UNHEALTHY), uptime, pingMs }
+
+    Return ONLY valid JSON — no explanation, no markdown:
+    {
+      "rsSet": "rs0",
+      "members": [
+        {"name": "mongo-0:27017", "state": "PRIMARY",   "health": "OK",        "uptime": 123456, "pingMs": 0},
+        {"name": "mongo-1:27017", "state": "SECONDARY",  "health": "OK",        "uptime": 123400, "pingMs": 2},
+        {"name": "mongo-2:27017", "state": "SECONDARY",  "health": "UNHEALTHY", "uptime": 0,      "pingMs": 0}
+      ],
+      "memberCount": 3
+    }
+
+    If the query fails return: {"rsSet": "N/A", "members": [], "memberCount": 0, "error": "<reason>"}
+  outputExtraction:
+    type: json
+    pattern: "$"
+  outputExtraction:
+    type: json
+    pattern: "$"
+
+---
+# Agent 2: Generates a rich, self-contained HTML report from the version data.
+apiVersion: ottoflow.nirmata.io/v1alpha1
+kind: Agent
+metadata:
+  name: nirmata-report-generator-agent
+  namespace: ottoflow
+spec:
+  modelProvider: anthropic
+  prompt: |
+    You are an HTML report generator for the Nirmata platform.
+
+    When given:
+      - A list of NDP services (name, kind, version, image repository)
+      - A list of clusters (name, Kubernetes version, NKC version, state)
+      - The Nirmata management URL
+      - A timestamp
+
+    Generate a complete, self-contained, single-file HTML report with:
+
+    1. A styled header with the Nirmata URL and generation timestamp
+    2. Three summary cards: total NDP services, total clusters, and NKC data source
+    3. Table 1 titled "NDP Service Versions":
+       columns: Service/Workload | Kind | Version | Image Repository
+       - Kind column shows "Deployment" or "StatefulSet" as a colored badge
+       - Version column uses monospace font
+    4. Table 2 titled "Clusters & Nirmata Kube Controller Versions":
+       columns: Cluster Name | Kubernetes Version | NKC Version | State
+       - State column uses colored badges: green=running/active, red=failed/error, amber=others
+    5. A footer with the generation timestamp
+
+    Use inline CSS only (no external dependencies). Use a professional dark-header /
+    light-body design with the Nirmata brand color #e94560 for accents.
+
+    Return ONLY the raw HTML string starting with <!DOCTYPE html>.
+    No markdown fences. No explanation. Just the HTML.
+  outputExtraction:
+    type: text

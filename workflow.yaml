@@ -1,0 +1,243 @@
+apiVersion: ottoflow.nirmata.io/v1alpha1
+kind: Workflow
+metadata:
+  name: nirmata-version-check
+  namespace: ottoflow
+spec:
+
+  # ── Inputs ─────────────────────────────────────────────────────────────────
+  inputs:
+    - name: nirmataUrl
+      description: "Nirmata management URL, e.g. p2.nirmata.co (no https://)"
+      required: true
+    - name: apiKey
+      description: "Nirmata API key"
+      required: true
+    - name: namespace
+      description: "Namespace where Nirmata NDP services run"
+      default: "nirmata"
+    - name: clusterJson
+      description: "Pre-fetched cluster JSON array from run-report.sh"
+      default: "[]"
+    - name: rsJson
+      description: "Pre-fetched MongoDB RS status JSON from run-report.sh"
+      default: "{}"
+
+  # ── Steps ──────────────────────────────────────────────────────────────────
+  steps:
+
+    # ── Step 1: NDP service versions from management cluster (K8s API) ────────
+    - name: getNDPWorkloads
+      message: "Collect NDP service versions from management cluster"
+      expressions:
+        - name: deployments
+          expression: 'dyn(resource.List("apps/v1", "Deployment", inputs.namespace, {})).items'
+        - name: statefulsets
+          expression: 'dyn(resource.List("apps/v1", "StatefulSet", inputs.namespace, {})).items'
+        - name: deploymentRows
+          expression: >-
+            expressions.deployments.map(d,
+              string(d.metadata.name) + "|Deployment|" +
+              (string(d.spec.template.spec.containers[0].image).contains(":")
+                ? string(d.spec.template.spec.containers[0].image).split(":")[1]
+                : "latest") + "|" +
+              (string(d.spec.template.spec.containers[0].image).contains(":")
+                ? string(d.spec.template.spec.containers[0].image).split(":")[0]
+                : string(d.spec.template.spec.containers[0].image))
+            )
+        - name: statefulsetRows
+          expression: >-
+            expressions.statefulsets.map(s,
+              string(s.metadata.name) + "|StatefulSet|" +
+              (string(s.spec.template.spec.containers[0].image).contains(":")
+                ? string(s.spec.template.spec.containers[0].image).split(":")[1]
+                : "latest") + "|" +
+              (string(s.spec.template.spec.containers[0].image).contains(":")
+                ? string(s.spec.template.spec.containers[0].image).split(":")[0]
+                : string(s.spec.template.spec.containers[0].image))
+            )
+      outputs:
+        - name: ndpServices
+          expression: 'expressions.deploymentRows + expressions.statefulsetRows'
+        - name: deploymentCount
+          expression: 'string(size(expressions.deploymentRows))'
+        - name: statefulsetCount
+          expression: 'string(size(expressions.statefulsetRows))'
+
+    # ── Step 2: Parse pre-fetched cluster JSON (fetched by run-report.sh) ────────
+    # run-report.sh uses kubectl port-forward + curl -k to get the cluster list
+    # and passes it as the clusterJson input — avoids TLS issues in CEL http.get.
+    - name: getNirmataClusters
+      message: "Parse cluster list from pre-fetched JSON"
+      expressions:
+        - name: parsed
+          expression: 'json.unmarshal(inputs.clusterJson)'
+        - name: clusterRows
+          expression: >-
+            type(expressions.parsed) == type([])
+            ? expressions.parsed.map(c,
+                (has(c.name) && c.name != null ? string(c.name) : "unknown") + "|" +
+                (has(c.k8sVersion) && c.k8sVersion != null ? string(c.k8sVersion) : "N/A") + "|" +
+                (has(c.nkcVersion) && c.nkcVersion != null ? string(c.nkcVersion) : "N/A") + "|" +
+                (has(c.state) && c.state != null ? string(c.state) : "unknown")
+              )
+            : ["No cluster data — MongoDB query may have failed|N/A|N/A|unknown"]
+      outputs:
+        - name: clusters
+          expression: 'expressions.clusterRows'
+        - name: clusterCount
+          expression: 'string(size(expressions.clusterRows))'
+
+    # ── Step 2b: MongoDB Replica Set status ───────────────────────────────────
+    - name: getMongoRSStatus
+      message: "Parse MongoDB RS status from pre-fetched JSON"
+      failurePolicy: Continue
+      expressions:
+        - name: rsData
+          expression: 'json.unmarshal(inputs.rsJson)'
+        - name: rsSet
+          expression: 'has(expressions.rsData.set) && expressions.rsData.set != null ? string(expressions.rsData.set) : "N/A"'
+        - name: rsMembers
+          expression: >-
+            has(expressions.rsData.members) && expressions.rsData.members != null
+            ? expressions.rsData.members.map(m,
+                (has(m.name) && m.name != null ? string(m.name) : "unknown") + "|" +
+                (has(m.stateStr) && m.stateStr != null ? string(m.stateStr) : "N/A") + "|" +
+                (has(m.health) ? (m.health == 1 ? "OK" : "UNHEALTHY") : "N/A") + "|" +
+                (has(m.uptime) && m.uptime != null ? string(m.uptime) + "s" : "N/A") + "|" +
+                (has(m.pingMs) && m.pingMs != null ? string(m.pingMs) + "ms" : "0ms")
+              )
+            : []
+      outputs:
+        - name: rsSet
+          expression: 'expressions.rsSet'
+        - name: rsMembers
+          expression: 'expressions.rsMembers'
+        - name: rsOk
+          expression: '"true"'
+
+    # ── Step 3: Build HTML report (pure CEL string — no LLM) ──────────────────
+    - name: generateHTMLReport
+      message: "Build HTML version report"
+      dependsOn:
+        - getNDPWorkloads
+        - getNirmataClusters
+        - getMongoRSStatus
+      expressions:
+        - name: svcTableRows
+          expression: >-
+            variables.ndpServices.map(row,
+              "<tr>" +
+              "<td>" + row.split("|")[0] + "</td>" +
+              "<td><span class=\"badge badge-" + row.split("|")[1].lowerAscii() + "\">" + row.split("|")[1] + "</span></td>" +
+              "<td><code>" + row.split("|")[2] + "</code></td>" +
+              "<td class=\"repo\">" + row.split("|")[3] + "</td>" +
+              "</tr>"
+            ).join("\n")
+        - name: clusterTableRows
+          expression: >-
+            variables.clusters.map(row,
+              "<tr>" +
+              "<td>" + row.split("|")[0] + "</td>" +
+              "<td><code>" + row.split("|")[1] + "</code></td>" +
+              "<td><code>" + row.split("|")[2] + "</code></td>" +
+              "<td><span class=\"state state-" +
+                (row.split("|")[3].lowerAscii() == "running" || row.split("|")[3].lowerAscii() == "active" || row.split("|")[3].lowerAscii() == "ready" ? "ok" :
+                 row.split("|")[3].lowerAscii() == "failed"  || row.split("|")[3].lowerAscii() == "error" ? "err" : "warn") +
+              "\">" + row.split("|")[3] + "</span></td>" +
+              "</tr>"
+            ).join("\n")
+        - name: rsTableRows
+          expression: >-
+            has(variables.rsMembers) && size(variables.rsMembers) > 0
+            ? variables.rsMembers.map(row,
+                "<tr>" +
+                "<td><code>" + row.split("|")[0] + "</code></td>" +
+                "<td><span class=\"state state-" +
+                  (row.split("|")[1].lowerAscii() == "primary" ? "ok" :
+                   row.split("|")[1].lowerAscii() == "secondary" || row.split("|")[1].lowerAscii() == "arbiter" ? "info" : "err") +
+                "\">" + row.split("|")[1] + "</span></td>" +
+                "<td><span class=\"state state-" + (row.split("|")[2] == "OK" ? "ok" : "err") + "\">" + row.split("|")[2] + "</span></td>" +
+                "<td>" + row.split("|")[3] + "</td>" +
+                "<td>" + row.split("|")[4] + "</td>" +
+                "</tr>"
+              ).join("\n")
+            : "<tr><td colspan=\"5\" style=\"text-align:center;color:#999;padding:1rem\">No RS data</td></tr>"
+        - name: html
+          expression: >-
+            "<!DOCTYPE html><html lang=\"en\"><head><meta charset=\"UTF-8\"><title>Nirmata Version Report</title><style>" +
+            "*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}" +
+            "body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#f0f2f5;color:#1a1a2e;padding:2rem}" +
+            ".page{max-width:1200px;margin:0 auto}" +
+            ".report-header{background:linear-gradient(135deg,#1a1a2e 0%,#16213e 60%,#0f3460 100%);color:#fff;border-radius:12px;padding:2rem 2.5rem;margin-bottom:1.5rem;display:flex;align-items:center;justify-content:space-between;gap:1rem}" +
+            ".report-header h1{font-size:1.6rem;font-weight:700}" +
+            ".report-header .meta{font-size:0.82rem;opacity:0.65;margin-top:0.35rem}" +
+            ".logo{background:#e94560;color:#fff;font-weight:800;font-size:1.05rem;padding:0.55rem 1.1rem;border-radius:8px;letter-spacing:1.5px}" +
+            ".summary{display:flex;gap:1rem;margin-bottom:1.75rem;flex-wrap:wrap}" +
+            ".pill{background:#fff;border-radius:10px;padding:1rem 1.4rem;box-shadow:0 1px 4px rgba(0,0,0,.07);flex:1;min-width:150px;border-top:3px solid #e94560}" +
+            ".pill .label{font-size:0.72rem;color:#888;text-transform:uppercase;letter-spacing:0.6px;font-weight:600}" +
+            ".pill .value{font-size:1.7rem;font-weight:700;color:#0f3460;margin-top:0.25rem}" +
+            ".section{margin-bottom:2.25rem}" +
+            ".section-title{font-size:0.95rem;font-weight:700;color:#0f3460;margin-bottom:0.75rem;padding-bottom:0.5rem;border-bottom:2px solid #e94560;display:flex;align-items:center;gap:0.5rem}" +
+            ".source-tag{font-size:0.7rem;font-weight:500;background:#e8f0fe;color:#1a73e8;padding:0.15rem 0.55rem;border-radius:20px;margin-left:auto}" +
+            ".table-wrap{background:#fff;border-radius:10px;overflow:hidden;box-shadow:0 1px 4px rgba(0,0,0,.07)}" +
+            "table{width:100%;border-collapse:collapse;font-size:0.875rem}" +
+            "thead tr{background:#0f3460;color:#fff}" +
+            "thead th{padding:0.75rem 1rem;text-align:left;font-weight:600;white-space:nowrap}" +
+            "tbody tr{border-bottom:1px solid #f0f2f5}" +
+            "tbody tr:last-child{border-bottom:none}" +
+            "tbody tr:hover{background:#f7f9ff}" +
+            "tbody td{padding:0.65rem 1rem;vertical-align:middle}" +
+            "code{background:#f0f2f5;padding:0.15rem 0.45rem;border-radius:4px;font-family:'SF Mono','Fira Code',monospace;font-size:0.82rem;color:#c7254e}" +
+            ".repo{color:#888;font-size:0.8rem;font-family:'SF Mono',monospace}" +
+            ".badge{display:inline-block;font-size:0.7rem;padding:0.18rem 0.55rem;border-radius:20px;font-weight:600}" +
+            ".badge-deployment{background:#e8f0fe;color:#1a73e8}" +
+            ".badge-statefulset{background:#fce8b2;color:#b06000}" +
+            ".state{display:inline-block;padding:0.2rem 0.65rem;border-radius:20px;font-size:0.75rem;font-weight:600}" +
+            ".state-ok{background:#e6f4ea;color:#1e8e3e}" +
+            ".state-err{background:#fce8e6;color:#c5221f}" +
+            ".state-warn{background:#fef7e0;color:#b06000}" +
+            ".state-info{background:#e8f0fe;color:#1a73e8}" +
+            ".footer{text-align:center;font-size:0.78rem;color:#aaa;margin-top:2rem;padding-top:1rem;border-top:1px solid #e0e0e0}" +
+            "</style></head><body><div class=\"page\">" +
+            "<div class=\"report-header\"><div><h1>Nirmata Version Report</h1>" +
+            "<div class=\"meta\">Host: " + inputs.nirmataUrl + " &nbsp;&middot;&nbsp; Namespace: " + inputs.namespace + "</div></div>" +
+            "<div class=\"logo\">NIRMATA</div></div>" +
+            "<div class=\"summary\">" +
+            "<div class=\"pill\"><div class=\"label\">NDP Services</div><div class=\"value\">" + variables.deploymentCount + "</div></div>" +
+            "<div class=\"pill\"><div class=\"label\">StatefulSets</div><div class=\"value\">" + variables.statefulsetCount + "</div></div>" +
+            "<div class=\"pill\"><div class=\"label\">Clusters</div><div class=\"value\">" + variables.clusterCount + "</div></div>" +
+            "<div class=\"pill\"><div class=\"label\">RS Set</div><div class=\"value\" style=\"font-size:0.9rem;margin-top:0.35rem\">" + (has(variables.rsSet) ? variables.rsSet : "N/A") + "</div></div>" +
+            "<div class=\"pill\"><div class=\"label\">RS Members</div><div class=\"value\">" + (has(variables.rsMembers) ? string(size(variables.rsMembers)) : "0") + "</div></div>" +
+            "</div>" +
+            "<div class=\"section\"><div class=\"section-title\">NDP Service Versions<span class=\"source-tag\">kubectl &middot; ns: " + inputs.namespace + "</span></div>" +
+            "<div class=\"table-wrap\"><table><thead><tr><th>Service / Workload</th><th>Kind</th><th>Version / Tag</th><th>Image Repository</th></tr></thead><tbody>" +
+            expressions.svcTableRows +
+            "</tbody></table></div></div>" +
+            "<div class=\"section\"><div class=\"section-title\">Clusters &amp; Nirmata Kube Controller Versions<span class=\"source-tag\">Nirmata API</span></div>" +
+            "<div class=\"table-wrap\"><table><thead><tr><th>Cluster Name</th><th>Kubernetes Version</th><th>NKC Version</th><th>State</th></tr></thead><tbody>" +
+            expressions.clusterTableRows +
+            "</tbody></table></div></div>" +
+            "<div class=\"section\"><div class=\"section-title\">MongoDB Replica Set Status<span class=\"source-tag\">RS: " + (has(variables.rsSet) ? variables.rsSet : "N/A") + "</span></div>" +
+            "<div class=\"table-wrap\"><table><thead><tr><th>Member</th><th>Role</th><th>Health</th><th>Uptime</th><th>Ping</th></tr></thead><tbody>" +
+            expressions.rsTableRows +
+            "</tbody></table></div></div>" +
+            "<div class=\"footer\">Nirmata Version Checker &nbsp;&middot;&nbsp; " + inputs.nirmataUrl + "</div>" +
+            "</div></body></html>"
+      outputs:
+        - name: htmlReport
+          expression: 'expressions.html'
+
+
+  # ── Workflow outputs ────────────────────────────────────────────────────────
+  outputs:
+    - name: serviceCount
+      expression: 'variables.deploymentCount'
+    - name: clusterCount
+      expression: 'variables.clusterCount'
+    - name: ndpServices
+      expression: 'variables.ndpServices'
+    - name: clusters
+      expression: 'variables.clusters'
+    - name: htmlReport
+      expression: 'variables.htmlReport'

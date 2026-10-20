@@ -1,0 +1,89 @@
+---
+# One-shot WorkflowRun — run manually with:
+#   kubectl apply -f run.yaml
+# or via the CLI:
+#   ottoflow run nirmata-version-check \
+#     --input nirmataUrl=nirmata.example.com \
+#     --input apiKey=<your-key> \
+#     --input namespace=nirmata
+#
+# To read the HTML report afterwards:
+#   kubectl get configmap nirmata-version-report -n nirmata -o jsonpath='{.data.report\.html}' > report.html && open report.html
+apiVersion: ottoflow.nirmata.io/v1alpha1
+kind: WorkflowRun
+metadata:
+  name: nirmata-version-check-run
+  namespace: ottoflow
+spec:
+  workflowRef:
+    name: nirmata-version-check
+  inputValues:
+    # Override these values or inject them from environment/CI
+    nirmataUrl: "nirmata.example.com"
+    # apiKey is loaded from the Secret below — do not put plain-text keys here
+    namespace: "nirmata"
+    httpsProxy: ""
+    noProxy: "localhost,127.0.0.1"
+
+---
+# Scheduled WorkflowRun — runs daily at 09:00 UTC, credentials from Secret.
+# Apply agents.yaml + workflow.yaml + secret.yaml first, then this file.
+apiVersion: ottoflow.nirmata.io/v1alpha1
+kind: Workflow
+metadata:
+  name: nirmata-version-check-scheduled
+  namespace: ottoflow
+spec:
+  inputs:
+    - name: nirmataUrl
+      required: true
+    - name: apiKey
+      required: true
+    - name: namespace
+      default: "nirmata"
+    - name: httpsProxy
+      default: ""
+    - name: noProxy
+      default: "localhost,127.0.0.1"
+
+  # Inherit all steps from the main workflow via workflowRef
+  steps:
+    - name: runVersionCheck
+      message: "Run nirmata-version-check as a sub-workflow"
+      workflowRef:
+        name: nirmata-version-check
+        inputs:
+          nirmataUrl:  'inputs.nirmataUrl'
+          apiKey:      'inputs.apiKey'
+          namespace:   'inputs.namespace'
+          httpsProxy:  'inputs.httpsProxy'
+          noProxy:     'inputs.noProxy'
+
+  triggers:
+    - cron:
+        # Every day at 09:00 UTC
+        schedule: "0 9 * * *"
+        timezone: "UTC"
+        concurrencyPolicy: Replace
+        # Inject credentials from Kubernetes Secret — no plain-text keys in YAML
+        inputValuesFrom:
+          - inputName: nirmataUrl
+            secretRef:
+              name: nirmata-api-credentials
+              key: nirmataUrl
+          - inputName: apiKey
+            secretRef:
+              name: nirmata-api-credentials
+              key: apiKey
+          - inputName: httpsProxy
+            secretRef:
+              name: nirmata-api-credentials
+              key: httpsProxy
+          - inputName: noProxy
+            secretRef:
+              name: nirmata-api-credentials
+              key: noProxy
+
+  outputs:
+    - name: result
+      expression: 'outputs.runVersionCheck'
