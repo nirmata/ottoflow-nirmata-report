@@ -84,8 +84,16 @@ echo "Checking Kafka pods..."
 
 get_kafka_pod_disk() {
   local pod="$1"
-  kubectl exec -n "${NAMESPACE}" "${pod}" -- \
-    df /var/lib/kafka/data --output=pcent 2>/dev/null | tail -1 | tr -d ' %' || echo "N/A"
+  # Try the most common Nirmata kafka data paths
+  for path in /var/lib/kafka /var/lib/kafka/data /kafka/data /data; do
+    result=$(kubectl exec -n "${NAMESPACE}" "${pod}" -- \
+      df "${path}" --output=pcent 2>/dev/null | tail -1 | tr -d ' %')
+    if [ -n "${result}" ] && [ "${result}" != "Use%" ]; then
+      echo "${result}"
+      return
+    fi
+  done
+  echo "N/A"
 }
 
 # Kafka brokers (exclude controller pods)

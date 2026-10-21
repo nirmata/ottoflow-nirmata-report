@@ -159,8 +159,8 @@ spec:
             ? expressions.data.pods.map(p,
                 (has(p.name) ? string(p.name) : "unknown") + "|Kafka|" +
                 (has(p.diskPct) && p.diskPct != null ? string(p.diskPct) + "%" : "N/A") + "|" +
-                (has(p.diskPct) && p.diskPct != null && int(string(p.diskPct)) > 80 ? "critical" :
-                 has(p.diskPct) && p.diskPct != null && int(string(p.diskPct)) > 60 ? "warning" : "ok")
+                (has(p.diskPct) && p.diskPct != null && string(p.diskPct) != "N/A" && int(string(p.diskPct)) > 80 ? "critical" :
+                 has(p.diskPct) && p.diskPct != null && string(p.diskPct) != "N/A" && int(string(p.diskPct)) > 60 ? "warning" : "ok")
               )
             : []
         - name: controllerRows
@@ -169,8 +169,8 @@ spec:
             ? expressions.data.controllerPods.map(p,
                 (has(p.name) ? string(p.name) : "unknown") + "|Controller|" +
                 (has(p.diskPct) && p.diskPct != null ? string(p.diskPct) + "%" : "N/A") + "|" +
-                (has(p.diskPct) && p.diskPct != null && int(string(p.diskPct)) > 80 ? "critical" :
-                 has(p.diskPct) && p.diskPct != null && int(string(p.diskPct)) > 60 ? "warning" : "ok")
+                (has(p.diskPct) && p.diskPct != null && string(p.diskPct) != "N/A" && int(string(p.diskPct)) > 80 ? "critical" :
+                 has(p.diskPct) && p.diskPct != null && string(p.diskPct) != "N/A" && int(string(p.diskPct)) > 60 ? "warning" : "ok")
               )
             : []
       outputs:
@@ -386,7 +386,7 @@ spec:
                 "<td><code>" + row.split("|")[0] + "</code></td>" +
                 "<td><span class=\"badge badge-" + row.split("|")[1].lowerAscii() + "\">" + row.split("|")[1] + "</span></td>" +
                 "<td>" +
-                  "<div class=\"disk-bar\"><div class=\"disk-fill\" style=\"width:" + row.split("|")[2].replace("%","") + "%;background:" +
+                  "<div class=\"disk-bar\"><div class=\"disk-fill\" style=\"width:" + (row.split("|")[2] != "N/A" ? row.split("|")[2].replace("%","") : "0") + "%;background:" +
                   (row.split("|")[3] == "critical" ? "#c5221f" : row.split("|")[3] == "warning" ? "#b06000" : "#1e8e3e") + "\"></div></div>" +
                   row.split("|")[2] +
                 "</td>" +
