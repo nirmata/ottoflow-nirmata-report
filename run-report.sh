@@ -3,9 +3,32 @@
 
 set -uo pipefail
 
-OTTOFLOW_DIR="/Users/rahul/allrepos/main/ottoflow"
-WORKFLOW_DIR="/Users/rahul/Downloads/nirmata-version-check-workflow"
+# Workflow files live alongside this script
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+WORKFLOW_DIR="${SCRIPT_DIR}"
 REPORT_FILE="/tmp/nirmata-version-report.html"
+
+# Find ottoflow binary: prefer PATH, then common locations
+if command -v ottoflow &>/dev/null; then
+  OTTOFLOW_BIN="ottoflow"
+else
+  # Search relative to the script dir and common build output paths
+  for candidate in \
+    "${SCRIPT_DIR}/../ottoflow/bin/ottoflow" \
+    "${SCRIPT_DIR}/bin/ottoflow" \
+    "${HOME}/ottoflow/bin/ottoflow"; do
+    if [ -x "${candidate}" ]; then
+      OTTOFLOW_BIN="${candidate}"
+      break
+    fi
+  done
+  if [ -z "${OTTOFLOW_BIN:-}" ]; then
+    echo "ERROR: ottoflow binary not found."
+    echo "Either add it to PATH or place it at: ${SCRIPT_DIR}/bin/ottoflow"
+    echo "Build it with: cd ottoflow && make build-cli"
+    exit 1
+  fi
+fi
 
 # ── Inputs ────────────────────────────────────────────────────────────────────
 read -rp  "Nirmata URL [p2.nirmata.co]: "              NIRMATA_URL;  NIRMATA_URL="${NIRMATA_URL:-p2.nirmata.co}"
@@ -140,7 +163,7 @@ KAFKA_HEALTH_JSON="{\"pods\":${KAFKA_POD_JSON},\"controllerPods\":${KAFKA_CTRL_J
 echo
 echo "Running OttoFlow workflow..."
 
-OUTPUT=$("${OTTOFLOW_DIR}/bin/ottoflow" run nirmata-version-check \
+OUTPUT=$("${OTTOFLOW_BIN}" run nirmata-version-check \
   --workflow-dir "${WORKFLOW_DIR}" \
   --input nirmataUrl="${NIRMATA_URL}" \
   --input apiKey="${API_KEY}" \
