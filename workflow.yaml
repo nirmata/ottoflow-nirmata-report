@@ -54,9 +54,21 @@ spec:
       description: "Recent Kafka ERROR log lines per pod as JSON object {podName:[lines]}"
       default: "{}"
 
-    # Slack alert (production-nch channel) — only fires when unhealthy
+    # ── Slack alert configuration ──────────────────────────────────────────
+    # Method A: Incoming Webhook — channel is fixed when webhook is created
     - name: slackWebhookUrl
-      description: "Slack webhook URL for production-nch alerts (leave blank to disable)"
+      description: "Slack incoming webhook URL (channel fixed at creation)"
+      default: ""
+    # Method B: Bot Token — channel/recipient configurable at runtime
+    - name: slackToken
+      description: "Slack bot token (xoxb-...) for chat.postMessage API"
+      default: ""
+    - name: slackChannel
+      description: "Channel (#name), channel ID, or user ID (U123) for DM"
+      default: "#production-nch"
+    # Applies to both methods
+    - name: slackMentions
+      description: "Comma-separated Slack user IDs to @-mention in alert (e.g. U04ABC,U04DEF)"
       default: ""
 
   # ── Steps ──────────────────────────────────────────────────────────────────
@@ -635,7 +647,7 @@ spec:
         - getKafkaLogs
       matchConditions:
         - name: slack-enabled
-          expression: 'inputs.slackWebhookUrl != ""'
+          expression: 'inputs.slackWebhookUrl != "" || inputs.slackToken != ""'
         - name: has-issues
           expression: >-
             variables.notReadyCount != "0" ||
@@ -646,8 +658,14 @@ spec:
             (has(variables.kafkaLogErrorCount) && variables.kafkaLogErrorCount != "0") ||
             (has(variables.rsUnhealthyCount) && variables.rsUnhealthyCount != "0")
       expressions:
+        - name: mentions
+          expression: >-
+            inputs.slackMentions != ""
+            ? inputs.slackMentions.split(",").map(uid, "<@" + uid + ">").join(" ") + " "
+            : ""
         - name: alertText
           expression: >-
+            expressions.mentions +
             ":rotating_light: *Nirmata Health Alert* — `" + inputs.nirmataUrl + "` (ns: `" + inputs.namespace + "`)\n" +
             "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n" +
             (variables.notReadyCount != "0" ? ":x: Nodes not ready: *" + variables.notReadyCount + "*\n" : "") +
@@ -657,19 +675,35 @@ spec:
             (variables.podPendingCount != "0" ? ":warning: Pending pods: *" + variables.podPendingCount + "*\n" : "") +
             (has(variables.mongoDiskStatus) && variables.mongoDiskStatus == "critical" ? ":x: MongoDB disk CRITICAL: *" + variables.mongoDiskPct + "%*\n" : "") +
             (has(variables.mongoDiskStatus) && variables.mongoDiskStatus == "warning" ? ":warning: MongoDB disk warning: *" + variables.mongoDiskPct + "%*\n" : "") +
-            (has(variables.mongoWiredtigerWarn) && variables.mongoWiredtigerWarn == "true" ? ":warning: MongoDB WiredTiger file large: *" + variables.mongoWiredtigerSize + "*\n" : "") +
+            (has(variables.mongoWiredtigerWarn) && variables.mongoWiredtigerWarn == "true" ? ":warning: WiredTiger file large: *" + variables.mongoWiredtigerSize + "*\n" : "") +
             (has(variables.rsUnhealthyCount) && variables.rsUnhealthyCount != "0" ? ":x: MongoDB RS unhealthy members: *" + variables.rsUnhealthyCount + "*\n" : "") +
             (has(variables.mongoLogErrorCount) && variables.mongoLogErrorCount != "0" ? ":warning: MongoDB log errors (1h): *" + variables.mongoLogErrorCount + "*\n" : "") +
             (has(variables.kafkaLogErrorCount) && variables.kafkaLogErrorCount != "0" ? ":warning: Kafka log errors (1h): *" + variables.kafkaLogErrorCount + "*\n" : "") +
             "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n" +
             "_Run `bash run-report.sh` for the full HTML report._"
-        - name: slackPayload
+
+        # Method A: Incoming Webhook
+        - name: webhookResult
           expression: >-
-            http.post(
-              inputs.slackWebhookUrl,
-              {"text": expressions.alertText},
-              {"Content-Type": "application/json"}
-            )
+            inputs.slackWebhookUrl != ""
+            ? http.post(
+                inputs.slackWebhookUrl,
+                {"text": expressions.alertText},
+                {"Content-Type": "application/json"}
+              )
+            : {"skipped": true}
+
+        # Method B: Bot Token via chat.postMessage API
+        - name: tokenResult
+          expression: >-
+            inputs.slackToken != ""
+            ? http.post(
+                "https://slack.com/api/chat.postMessage",
+                {"channel": inputs.slackChannel, "text": expressions.alertText},
+                {"Content-Type": "application/json", "Authorization": "Bearer " + inputs.slackToken}
+              )
+            : {"skipped": true}
+
       outputs:
         - name: slackAlertSent
           expression: '"true"'

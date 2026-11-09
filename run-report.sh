@@ -41,7 +41,15 @@ echo "Sections (default: all)"
 echo "  all | versions | health"
 echo "  or pick individual: ndp,clusters,nodes,deployments,pods,mongo,kafka,rs,logs"
 read -rp  "Sections [all]: "                SECTIONS;    SECTIONS="${SECTIONS:-all}"
-read -rp  "Slack webhook URL for production-nch alerts [blank to skip]: " SLACK_URL
+echo
+echo "Slack alerts (leave all blank to disable):"
+echo "  Method A — Incoming Webhook (channel fixed when webhook is created)"
+echo "  Method B — Bot Token xoxb-... (channel/user configurable below)"
+read -rp  "  Webhook URL [blank to skip]: "          SLACK_URL
+read -rp  "  Bot Token xoxb-... [blank to skip]: "   SLACK_TOKEN
+read -rp  "  Channel or User ID [#production-nch]: " SLACK_CHANNEL
+SLACK_CHANNEL="${SLACK_CHANNEL:-#production-nch}"
+read -rp  "  @mention user IDs (comma-separated) [blank]: " SLACK_MENTIONS
 
 if [ -n "${PROXY_URL:-}" ]; then
   export HTTPS_PROXY="$PROXY_URL" https_proxy="$PROXY_URL"
@@ -186,6 +194,9 @@ OUTPUT=$("${OTTOFLOW_BIN}" run nirmata-version-check \
   --input mongoLogErrorsJson="${MONGO_LOG_ERRORS_JSON}" \
   --input kafkaLogErrorsJson="${KAFKA_LOG_ERRORS_JSON}" \
   --input slackWebhookUrl="${SLACK_URL:-}" \
+  --input slackToken="${SLACK_TOKEN:-}" \
+  --input slackChannel="${SLACK_CHANNEL}" \
+  --input slackMentions="${SLACK_MENTIONS:-}" \
   2>&1)
 
 echo "$OUTPUT"
