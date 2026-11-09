@@ -16,25 +16,55 @@ spec:
     - name: namespace
       description: "Namespace where Nirmata NDP services run"
       default: "nirmata"
+
+    # Selectable sections:
+    #   all       — everything (default)
+    #   versions  — ndp + clusters
+    #   health    — nodes + deployments + pods + mongo + kafka + logs
+    #   ndp       — NDP service versions only
+    #   clusters  — cluster / NKC versions only
+    #   nodes     — node health
+    #   deployments — deployment readiness
+    #   pods      — pod phase summary
+    #   mongo     — MongoDB RS + disk + logs
+    #   kafka     — Kafka pod health + logs
+    #   rs        — MongoDB RS status only
+    #   logs      — Kafka + MongoDB log errors only
+    - name: sections
+      description: "Comma-separated section names to include, or 'all'"
+      default: "all"
+
+    # Pre-fetched data from run-report.sh (MongoDB / Kafka kubectl exec)
     - name: clusterJson
-      description: "Pre-fetched cluster JSON array from run-report.sh"
+      description: "Pre-fetched cluster JSON array"
       default: "[]"
     - name: rsJson
-      description: "Pre-fetched MongoDB RS status JSON from run-report.sh"
+      description: "Pre-fetched MongoDB RS status JSON"
       default: "{}"
     - name: mongoHealthJson
-      description: "Pre-fetched MongoDB disk/health JSON from run-report.sh"
+      description: "Pre-fetched MongoDB disk/WiredTiger JSON"
       default: "{}"
     - name: kafkaHealthJson
-      description: "Pre-fetched Kafka pod/disk health JSON from run-report.sh"
+      description: "Pre-fetched Kafka pod disk JSON"
       default: "{}"
+    - name: mongoLogErrorsJson
+      description: "Recent MongoDB ERROR/FATAL log lines as JSON array"
+      default: "[]"
+    - name: kafkaLogErrorsJson
+      description: "Recent Kafka ERROR log lines per pod as JSON object {podName:[lines]}"
+      default: "{}"
+
+    # Slack alert (production-nch channel) — only fires when unhealthy
+    - name: slackWebhookUrl
+      description: "Slack webhook URL for production-nch alerts (leave blank to disable)"
+      default: ""
 
   # ── Steps ──────────────────────────────────────────────────────────────────
   steps:
 
-    # ── Step 1: NDP service versions (Deployments + StatefulSets) ─────────────
+    # ── Step 1: NDP service versions ──────────────────────────────────────────
     - name: getNDPWorkloads
-      message: "Collect NDP service versions from management cluster"
+      message: "Collect NDP service versions"
       expressions:
         - name: deployments
           expression: 'dyn(resource.List("apps/v1", "Deployment", inputs.namespace, {})).items'
@@ -70,9 +100,9 @@ spec:
         - name: statefulsetCount
           expression: 'string(size(expressions.statefulsetRows))'
 
-    # ── Step 2: Cluster list + NKC versions (from MongoDB via script) ──────────
+    # ── Step 2: Cluster + NKC versions ────────────────────────────────────────
     - name: getNirmataClusters
-      message: "Parse cluster list from pre-fetched MongoDB JSON"
+      message: "Parse cluster list from MongoDB"
       expressions:
         - name: parsed
           expression: 'json.unmarshal(inputs.clusterJson)'
@@ -85,14 +115,14 @@ spec:
                 (has(c.nkcVersion) && c.nkcVersion != null ? string(c.nkcVersion) : "N/A") + "|" +
                 (has(c.state) && c.state != null ? string(c.state) : "unknown")
               )
-            : ["No cluster data — MongoDB query may have failed|N/A|N/A|unknown"]
+            : ["No cluster data|N/A|N/A|unknown"]
       outputs:
         - name: clusters
           expression: 'expressions.clusterRows'
         - name: clusterCount
           expression: 'string(size(expressions.clusterRows))'
 
-    # ── Step 3: MongoDB RS status (from script) ────────────────────────────────
+    # ── Step 3: MongoDB RS status ──────────────────────────────────────────────
     - name: getMongoRSStatus
       message: "Parse MongoDB RS status"
       failurePolicy: Continue
@@ -112,15 +142,22 @@ spec:
                 (has(m.pingMs) && m.pingMs != null ? string(m.pingMs) + "ms" : "0ms")
               )
             : []
+        - name: hasUnhealthyMember
+          expression: >-
+            has(expressions.rsData.members) && expressions.rsData.members != null
+            ? string(size(expressions.rsData.members.filter(m, has(m.health) && m.health != 1)))
+            : "0"
       outputs:
         - name: rsSet
           expression: 'expressions.rsSet'
         - name: rsMembers
           expression: 'expressions.rsMembers'
+        - name: rsUnhealthyCount
+          expression: 'expressions.hasUnhealthyMember'
 
-    # ── Step 4: MongoDB disk health (from script) ──────────────────────────────
+    # ── Step 4: MongoDB disk health ────────────────────────────────────────────
     - name: getMongoHealth
-      message: "Parse MongoDB disk and health metrics"
+      message: "Parse MongoDB disk health"
       failurePolicy: Continue
       expressions:
         - name: data
@@ -133,8 +170,8 @@ spec:
           expression: 'has(expressions.data.wiredtigerWarn) && expressions.data.wiredtigerWarn == true ? "true" : "false"'
         - name: diskStatus
           expression: >-
-            has(expressions.data.diskPct) && expressions.data.diskPct != null
-            ? (int(expressions.data.diskPct) > 80 ? "critical" : int(expressions.data.diskPct) > 60 ? "warning" : "ok")
+            has(expressions.data.diskPct) && expressions.data.diskPct != null && string(expressions.data.diskPct) != "N/A"
+            ? (int(string(expressions.data.diskPct)) > 80 ? "critical" : int(string(expressions.data.diskPct)) > 60 ? "warning" : "ok")
             : "unknown"
       outputs:
         - name: mongoDiskPct
@@ -146,9 +183,9 @@ spec:
         - name: mongoDiskStatus
           expression: 'expressions.diskStatus'
 
-    # ── Step 5: Kafka health (from script) ────────────────────────────────────
+    # ── Step 5: Kafka health ───────────────────────────────────────────────────
     - name: getKafkaHealth
-      message: "Parse Kafka pod and disk health"
+      message: "Parse Kafka pod disk health"
       failurePolicy: Continue
       expressions:
         - name: data
@@ -177,17 +214,54 @@ spec:
         - name: kafkaRows
           expression: 'expressions.kafkaRows + expressions.controllerRows'
         - name: kafkaPodCount
-          expression: >-
-            has(expressions.data.pods) && expressions.data.pods != null
-            ? string(size(expressions.data.pods))
-            : "0"
+          expression: 'has(expressions.data.pods) ? string(size(expressions.data.pods)) : "0"'
         - name: kafkaControllerCount
-          expression: >-
-            has(expressions.data.controllerPods) && expressions.data.controllerPods != null
-            ? string(size(expressions.data.controllerPods))
-            : "0"
+          expression: 'has(expressions.data.controllerPods) ? string(size(expressions.data.controllerPods)) : "0"'
 
-    # ── Step 6: Node health (K8s API) ─────────────────────────────────────────
+    # ── Step 6: MongoDB log errors ─────────────────────────────────────────────
+    - name: getMongoLogs
+      message: "Parse MongoDB log errors"
+      failurePolicy: Continue
+      expressions:
+        - name: errors
+          expression: 'json.unmarshal(inputs.mongoLogErrorsJson)'
+        - name: errorCount
+          expression: 'type(expressions.errors) == type([]) ? string(size(expressions.errors)) : "0"'
+        - name: errorRows
+          expression: >-
+            type(expressions.errors) == type([]) && size(expressions.errors) > 0
+            ? expressions.errors.map(line, "<tr><td class=\"log-line\">" + string(line) + "</td></tr>").join("\n")
+            : "<tr><td style=\"color:#999;padding:1rem;text-align:center\">No errors in last hour</td></tr>"
+      outputs:
+        - name: mongoLogErrorCount
+          expression: 'expressions.errorCount'
+        - name: mongoLogErrorRows
+          expression: 'expressions.errorRows'
+
+    # ── Step 7: Kafka log errors ───────────────────────────────────────────────
+    - name: getKafkaLogs
+      message: "Parse Kafka log errors"
+      failurePolicy: Continue
+      expressions:
+        - name: data
+          expression: 'json.unmarshal(inputs.kafkaLogErrorsJson)'
+        - name: totalErrors
+          expression: >-
+            type(expressions.data) == type({})
+            ? string(expressions.data.totalErrors != null ? expressions.data.totalErrors : 0)
+            : "0"
+        - name: errorRows
+          expression: >-
+            has(expressions.data.samples) && expressions.data.samples != null && size(expressions.data.samples) > 0
+            ? expressions.data.samples.map(line, "<tr><td class=\"log-line\">" + string(line) + "</td></tr>").join("\n")
+            : "<tr><td style=\"color:#999;padding:1rem;text-align:center\">No errors in last hour</td></tr>"
+      outputs:
+        - name: kafkaLogErrorCount
+          expression: 'expressions.totalErrors'
+        - name: kafkaLogErrorRows
+          expression: 'expressions.errorRows'
+
+    # ── Step 8: Node health ────────────────────────────────────────────────────
     - name: getNodeHealth
       message: "Check Kubernetes node health"
       expressions:
@@ -221,9 +295,9 @@ spec:
         - name: cordonedCount
           expression: 'expressions.cordonedCount'
 
-    # ── Step 7: Deployment health (K8s API) ───────────────────────────────────
+    # ── Step 9: Deployment health ──────────────────────────────────────────────
     - name: getDeploymentHealth
-      message: "Check deployment readiness in namespace"
+      message: "Check deployment readiness"
       dependsOn:
         - getNDPWorkloads
       expressions:
@@ -248,9 +322,9 @@ spec:
         - name: unhealthyDeploymentCount
           expression: 'expressions.unhealthyCount'
 
-    # ── Step 8: Pod health (K8s API) ──────────────────────────────────────────
+    # ── Step 10: Pod health ────────────────────────────────────────────────────
     - name: getPodHealth
-      message: "Count pods by phase in namespace"
+      message: "Count pods by phase"
       expressions:
         - name: pods
           expression: 'dyn(resource.List("v1", "Pod", inputs.namespace, {})).items'
@@ -260,16 +334,12 @@ spec:
           expression: 'string(size(expressions.pods.filter(p, string(p.status.phase) == "Pending")))'
         - name: failedCount
           expression: 'string(size(expressions.pods.filter(p, string(p.status.phase) == "Failed")))'
-        - name: pendingRows
+        - name: issueRows
           expression: >-
-            expressions.pods.filter(p, string(p.status.phase) == "Pending").map(p,
-              string(p.metadata.name) + "|Pending"
-            )
-        - name: failedRows
-          expression: >-
-            expressions.pods.filter(p, string(p.status.phase) == "Failed").map(p,
-              string(p.metadata.name) + "|Failed"
-            )
+            (expressions.pods.filter(p, string(p.status.phase) == "Pending").map(p,
+              string(p.metadata.name) + "|Pending") +
+             expressions.pods.filter(p, string(p.status.phase) == "Failed").map(p,
+              string(p.metadata.name) + "|Failed"))
       outputs:
         - name: podRunningCount
           expression: 'expressions.runningCount'
@@ -278,47 +348,74 @@ spec:
         - name: podFailedCount
           expression: 'expressions.failedCount'
         - name: podIssueRows
-          expression: 'expressions.pendingRows + expressions.failedRows'
+          expression: 'expressions.issueRows'
 
-    # ── Step 9: Generate HTML report ──────────────────────────────────────────
+    # ── Step 11: Generate HTML report ─────────────────────────────────────────
     - name: generateHTMLReport
-      message: "Build HTML version and health report"
+      message: "Build HTML report"
       dependsOn:
         - getNDPWorkloads
         - getNirmataClusters
         - getMongoRSStatus
         - getMongoHealth
+        - getMongoLogs
         - getKafkaHealth
+        - getKafkaLogs
         - getNodeHealth
         - getDeploymentHealth
         - getPodHealth
       expressions:
 
-        # ── Service table rows
+        # ── Section visibility helpers
+        - name: showNdp
+          expression: >-
+            inputs.sections == "all" || inputs.sections.contains("ndp") || inputs.sections.contains("versions")
+        - name: showClusters
+          expression: >-
+            inputs.sections == "all" || inputs.sections.contains("clusters") || inputs.sections.contains("versions")
+        - name: showNodes
+          expression: >-
+            inputs.sections == "all" || inputs.sections.contains("nodes") || inputs.sections.contains("health")
+        - name: showDeployments
+          expression: >-
+            inputs.sections == "all" || inputs.sections.contains("deployments") || inputs.sections.contains("health")
+        - name: showPods
+          expression: >-
+            inputs.sections == "all" || inputs.sections.contains("pods") || inputs.sections.contains("health")
+        - name: showMongo
+          expression: >-
+            inputs.sections == "all" || inputs.sections.contains("mongo") || inputs.sections.contains("health")
+        - name: showRs
+          expression: >-
+            inputs.sections == "all" || inputs.sections.contains("rs") || inputs.sections.contains("mongo") || inputs.sections.contains("health")
+        - name: showKafka
+          expression: >-
+            inputs.sections == "all" || inputs.sections.contains("kafka") || inputs.sections.contains("health")
+        - name: showLogs
+          expression: >-
+            inputs.sections == "all" || inputs.sections.contains("logs") || inputs.sections.contains("mongo") || inputs.sections.contains("kafka") || inputs.sections.contains("health")
+
+        # ── NDP service table rows
         - name: svcTableRows
           expression: >-
             variables.ndpServices.map(row,
-              "<tr>" +
-              "<td>" + row.split("|")[0] + "</td>" +
+              "<tr><td>" + row.split("|")[0] + "</td>" +
               "<td><span class=\"badge badge-" + row.split("|")[1].lowerAscii() + "\">" + row.split("|")[1] + "</span></td>" +
               "<td><code>" + row.split("|")[2] + "</code></td>" +
-              "<td class=\"repo\">" + row.split("|")[3] + "</td>" +
-              "</tr>"
+              "<td class=\"repo\">" + row.split("|")[3] + "</td></tr>"
             ).join("\n")
 
         # ── Cluster table rows
         - name: clusterTableRows
           expression: >-
             variables.clusters.map(row,
-              "<tr>" +
-              "<td>" + row.split("|")[0] + "</td>" +
+              "<tr><td>" + row.split("|")[0] + "</td>" +
               "<td><code>" + row.split("|")[1] + "</code></td>" +
               "<td><code>" + row.split("|")[2] + "</code></td>" +
               "<td><span class=\"state state-" +
                 (row.split("|")[3].lowerAscii() == "running" || row.split("|")[3].lowerAscii() == "active" || row.split("|")[3].lowerAscii() == "ready" ? "ok" :
                  row.split("|")[3].lowerAscii() == "failed" || row.split("|")[3].lowerAscii() == "error" ? "err" : "warn") +
-              "\">" + row.split("|")[3] + "</span></td>" +
-              "</tr>"
+              "\">" + row.split("|")[3] + "</span></td></tr>"
             ).join("\n")
 
         # ── RS member table rows
@@ -326,43 +423,33 @@ spec:
           expression: >-
             has(variables.rsMembers) && size(variables.rsMembers) > 0
             ? variables.rsMembers.map(row,
-                "<tr>" +
-                "<td><code>" + row.split("|")[0] + "</code></td>" +
-                "<td><span class=\"state state-" +
-                  (row.split("|")[1].lowerAscii() == "primary" ? "ok" :
-                   row.split("|")[1].lowerAscii() == "secondary" || row.split("|")[1].lowerAscii() == "arbiter" ? "info" : "err") +
-                "\">" + row.split("|")[1] + "</span></td>" +
+                "<tr><td><code>" + row.split("|")[0] + "</code></td>" +
+                "<td><span class=\"state state-" + (row.split("|")[1].lowerAscii() == "primary" ? "ok" : row.split("|")[1].lowerAscii() == "secondary" || row.split("|")[1].lowerAscii() == "arbiter" ? "info" : "err") + "\">" + row.split("|")[1] + "</span></td>" +
                 "<td><span class=\"state state-" + (row.split("|")[2] == "OK" ? "ok" : "err") + "\">" + row.split("|")[2] + "</span></td>" +
-                "<td>" + row.split("|")[3] + "</td>" +
-                "<td>" + row.split("|")[4] + "</td>" +
-                "</tr>"
+                "<td>" + row.split("|")[3] + "</td><td>" + row.split("|")[4] + "</td></tr>"
               ).join("\n")
-            : "<tr><td colspan=\"5\" style=\"text-align:center;color:#999;padding:1rem\">No RS data</td></tr>"
+            : "<tr><td colspan=\"5\" class=\"empty\">No RS data</td></tr>"
 
         # ── Node health table rows
         - name: nodeTableRows
           expression: >-
             variables.nodeRows.map(row,
-              "<tr" + (row.split("|")[1] != "Ready" ? " style=\"background:#fff5f5\"" : "") + ">" +
+              "<tr" + (row.split("|")[1] != "Ready" ? " class=\"row-err\"" : "") + ">" +
               "<td><code>" + row.split("|")[0] + "</code></td>" +
               "<td><span class=\"state state-" + (row.split("|")[1] == "Ready" ? "ok" : "err") + "\">" + row.split("|")[1] + "</span></td>" +
               "<td><span class=\"state state-" + (row.split("|")[2] == "Schedulable" ? "ok" : "warn") + "\">" + row.split("|")[2] + "</span></td>" +
-              "<td><code>" + row.split("|")[3] + "</code></td>" +
-              "</tr>"
+              "<td><code>" + row.split("|")[3] + "</code></td></tr>"
             ).join("\n")
 
         # ── Deployment health table rows
         - name: deploymentHealthTableRows
           expression: >-
             variables.deploymentHealthRows.map(row,
-              "<tr" + (row.split("|")[3] == "err" ? " style=\"background:#fff5f5\"" : "") + ">" +
+              "<tr" + (row.split("|")[3] == "err" ? " class=\"row-err\"" : "") + ">" +
               "<td>" + row.split("|")[0] + "</td>" +
               "<td>" + row.split("|")[1] + "</td>" +
               "<td><strong>" + row.split("|")[2] + "</strong></td>" +
-              "<td><span class=\"state state-" + row.split("|")[3] + "\">" +
-                (row.split("|")[3] == "ok" ? "Healthy" : "Degraded") +
-              "</span></td>" +
-              "</tr>"
+              "<td><span class=\"state state-" + row.split("|")[3] + "\">" + (row.split("|")[3] == "ok" ? "Healthy" : "Degraded") + "</span></td></tr>"
             ).join("\n")
 
         # ── Pod issues table rows
@@ -370,55 +457,51 @@ spec:
           expression: >-
             size(variables.podIssueRows) > 0
             ? variables.podIssueRows.map(row,
-                "<tr>" +
-                "<td><code>" + row.split("|")[0] + "</code></td>" +
-                "<td><span class=\"state state-" + (row.split("|")[1] == "Failed" ? "err" : "warn") + "\">" + row.split("|")[1] + "</span></td>" +
-                "</tr>"
+                "<tr><td><code>" + row.split("|")[0] + "</code></td>" +
+                "<td><span class=\"state state-" + (row.split("|")[1] == "Failed" ? "err" : "warn") + "\">" + row.split("|")[1] + "</span></td></tr>"
               ).join("\n")
-            : "<tr><td colspan=\"2\" style=\"text-align:center;color:#999;padding:1rem\">All pods healthy</td></tr>"
+            : "<tr><td colspan=\"2\" class=\"empty\">All pods healthy</td></tr>"
 
         # ── Kafka table rows
         - name: kafkaTableRows
           expression: >-
             has(variables.kafkaRows) && size(variables.kafkaRows) > 0
             ? variables.kafkaRows.map(row,
-                "<tr" + (row.split("|")[3] == "critical" ? " style=\"background:#fff5f5\"" : row.split("|")[3] == "warning" ? " style=\"background:#fffbf0\"" : "") + ">" +
+                "<tr" + (row.split("|")[3] == "critical" ? " class=\"row-err\"" : row.split("|")[3] == "warning" ? " class=\"row-warn\"" : "") + ">" +
                 "<td><code>" + row.split("|")[0] + "</code></td>" +
                 "<td><span class=\"badge badge-" + row.split("|")[1].lowerAscii() + "\">" + row.split("|")[1] + "</span></td>" +
-                "<td>" +
-                  "<div class=\"disk-bar\"><div class=\"disk-fill\" style=\"width:" + (row.split("|")[2] != "N/A" ? row.split("|")[2].replace("%","") : "0") + "%;background:" +
+                "<td><div class=\"disk-bar\"><div class=\"disk-fill\" style=\"width:" +
+                  (row.split("|")[2] != "N/A" ? row.split("|")[2].replace("%","") : "0") + "%;background:" +
                   (row.split("|")[3] == "critical" ? "#c5221f" : row.split("|")[3] == "warning" ? "#b06000" : "#1e8e3e") + "\"></div></div>" +
-                  row.split("|")[2] +
-                "</td>" +
+                  row.split("|")[2] + "</td>" +
                 "<td><span class=\"state state-" + row.split("|")[3] + "\">" +
                   (row.split("|")[3] == "ok" ? "OK" : row.split("|")[3] == "warning" ? "Warning" : "Critical") +
-                "</span></td>" +
-                "</tr>"
+                "</span></td></tr>"
               ).join("\n")
-            : "<tr><td colspan=\"4\" style=\"text-align:center;color:#999;padding:1rem\">No Kafka pods found</td></tr>"
+            : "<tr><td colspan=\"4\" class=\"empty\">No Kafka pods found</td></tr>"
 
         # ── MongoDB disk bar
         - name: mongoDiskBar
           expression: >-
             has(variables.mongoDiskPct) && variables.mongoDiskPct != "N/A"
-            ? "<div class=\"disk-bar\"><div class=\"disk-fill\" style=\"width:" + variables.mongoDiskPct + "%;background:" +
-              (variables.mongoDiskStatus == "critical" ? "#c5221f" : variables.mongoDiskStatus == "warning" ? "#b06000" : "#1e8e3e") + "\"></div></div>" +
+            ? "<div class=\"disk-bar\"><div class=\"disk-fill\" style=\"width:" + variables.mongoDiskPct +
+              "%;background:" + (variables.mongoDiskStatus == "critical" ? "#c5221f" : variables.mongoDiskStatus == "warning" ? "#b06000" : "#1e8e3e") + "\"></div></div>" +
               variables.mongoDiskPct + "%"
             : "N/A"
 
-        # ── Full HTML
+        # ── CSS
         - name: css
           expression: >-
             "*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}" +
             "body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#f0f2f5;color:#1a1a2e;padding:2rem}" +
             ".page{max-width:1200px;margin:0 auto}" +
-            ".report-header{background:linear-gradient(135deg,#1a1a2e 0%,#16213e 60%,#0f3460 100%);color:#fff;border-radius:12px;padding:2rem 2.5rem;margin-bottom:1.5rem;display:flex;align-items:center;justify-content:space-between;gap:1rem}" +
+            ".report-header{background:linear-gradient(135deg,#1a1a2e 0%,#16213e 60%,#0f3460 100%);color:#fff;border-radius:12px;padding:2rem 2.5rem;margin-bottom:1.5rem;display:flex;align-items:center;justify-content:space-between}" +
             ".report-header h1{font-size:1.6rem;font-weight:700}" +
             ".report-header .meta{font-size:0.82rem;opacity:0.65;margin-top:0.35rem}" +
             ".logo{background:#e94560;color:#fff;font-weight:800;font-size:1.05rem;padding:0.55rem 1.1rem;border-radius:8px;letter-spacing:1.5px}" +
             ".summary{display:flex;gap:1rem;margin-bottom:1.75rem;flex-wrap:wrap}" +
             ".pill{background:#fff;border-radius:10px;padding:1rem 1.4rem;box-shadow:0 1px 4px rgba(0,0,0,.07);flex:1;min-width:130px;border-top:3px solid #e94560}" +
-            ".pill.warn{border-top-color:#b06000}.pill.err{border-top-color:#c5221f}.pill.ok{border-top-color:#1e8e3e}" +
+            ".pill.ok{border-top-color:#1e8e3e}.pill.warn{border-top-color:#b06000}.pill.err{border-top-color:#c5221f}" +
             ".pill .label{font-size:0.72rem;color:#888;text-transform:uppercase;letter-spacing:0.6px;font-weight:600}" +
             ".pill .value{font-size:1.7rem;font-weight:700;color:#0f3460;margin-top:0.25rem}" +
             ".pill .value.small{font-size:0.9rem;margin-top:0.35rem;color:#555;font-weight:500}" +
@@ -433,98 +516,163 @@ spec:
             "tbody tr:last-child{border-bottom:none}" +
             "tbody tr:hover{background:#f7f9ff}" +
             "tbody td{padding:0.65rem 1rem;vertical-align:middle}" +
+            ".row-err{background:#fff5f5!important}.row-warn{background:#fffbf0!important}" +
             "code{background:#f0f2f5;padding:0.15rem 0.45rem;border-radius:4px;font-family:'SF Mono','Fira Code',monospace;font-size:0.82rem;color:#c7254e}" +
             ".repo{color:#888;font-size:0.8rem;font-family:'SF Mono',monospace}" +
             ".badge{display:inline-block;font-size:0.7rem;padding:0.18rem 0.55rem;border-radius:20px;font-weight:600}" +
-            ".badge-deployment{background:#e8f0fe;color:#1a73e8}" +
-            ".badge-statefulset{background:#fce8b2;color:#b06000}" +
-            ".badge-kafka{background:#f3e8ff;color:#6f42c1}" +
-            ".badge-controller{background:#e8f8f5;color:#0d7a5f}" +
+            ".badge-deployment{background:#e8f0fe;color:#1a73e8}.badge-statefulset{background:#fce8b2;color:#b06000}" +
+            ".badge-kafka{background:#f3e8ff;color:#6f42c1}.badge-controller{background:#e8f8f5;color:#0d7a5f}" +
             ".state{display:inline-block;padding:0.2rem 0.65rem;border-radius:20px;font-size:0.75rem;font-weight:600}" +
-            ".state-ok{background:#e6f4ea;color:#1e8e3e}" +
-            ".state-err{background:#fce8e6;color:#c5221f}" +
-            ".state-warn{background:#fef7e0;color:#b06000}" +
-            ".state-info{background:#e8f0fe;color:#1a73e8}" +
-            ".state-critical{background:#fce8e6;color:#c5221f}" +
-            ".state-warning{background:#fef7e0;color:#b06000}" +
+            ".state-ok{background:#e6f4ea;color:#1e8e3e}.state-err{background:#fce8e6;color:#c5221f}" +
+            ".state-warn{background:#fef7e0;color:#b06000}.state-info{background:#e8f0fe;color:#1a73e8}" +
+            ".state-critical{background:#fce8e6;color:#c5221f}.state-warning{background:#fef7e0;color:#b06000}" +
             ".disk-bar{width:120px;height:8px;background:#e0e0e0;border-radius:4px;display:inline-block;vertical-align:middle;margin-right:0.5rem}" +
             ".disk-fill{height:100%;border-radius:4px}" +
+            ".log-line{font-family:'SF Mono','Fira Code',monospace;font-size:0.78rem;color:#c7254e;word-break:break-all;padding:0.4rem 1rem!important}" +
+            ".empty{text-align:center;color:#999;padding:1rem!important}" +
             ".footer{text-align:center;font-size:0.78rem;color:#aaa;margin-top:2rem;padding-top:1rem;border-top:1px solid #e0e0e0}"
 
+        # ── Full HTML
         - name: html
           expression: >-
             "<!DOCTYPE html><html lang=\"en\"><head><meta charset=\"UTF-8\"><title>Nirmata Version &amp; Health Report</title><style>" +
-            expressions.css +
-            "</style></head><body><div class=\"page\">" +
+            expressions.css + "</style></head><body><div class=\"page\">" +
 
             "<div class=\"report-header\"><div><h1>Nirmata Version &amp; Health Report</h1>" +
-            "<div class=\"meta\">Host: " + inputs.nirmataUrl + " &nbsp;&middot;&nbsp; Namespace: " + inputs.namespace + "</div></div>" +
+            "<div class=\"meta\">Host: " + inputs.nirmataUrl + " &nbsp;&middot;&nbsp; Namespace: " + inputs.namespace +
+            " &nbsp;&middot;&nbsp; Sections: " + inputs.sections + "</div></div>" +
             "<div class=\"logo\">NIRMATA</div></div>" +
 
             "<div class=\"summary\">" +
-            "<div class=\"pill\"><div class=\"label\">NDP Services</div><div class=\"value\">" + variables.deploymentCount + "</div></div>" +
-            "<div class=\"pill\"><div class=\"label\">StatefulSets</div><div class=\"value\">" + variables.statefulsetCount + "</div></div>" +
-            "<div class=\"pill\"><div class=\"label\">Clusters</div><div class=\"value\">" + variables.clusterCount + "</div></div>" +
-            "<div class=\"pill " + (variables.notReadyCount == "0" ? "ok" : "err") + "\"><div class=\"label\">Nodes</div><div class=\"value\">" + variables.nodeCount + "</div></div>" +
-            "<div class=\"pill " + (variables.unhealthyDeploymentCount == "0" ? "ok" : "err") + "\"><div class=\"label\">Unhealthy Deploys</div><div class=\"value\">" + variables.unhealthyDeploymentCount + "</div></div>" +
-            "<div class=\"pill " + (variables.podFailedCount == "0" && variables.podPendingCount == "0" ? "ok" : "warn") + "\"><div class=\"label\">Pods Running</div><div class=\"value\">" + variables.podRunningCount + "</div></div>" +
-            "<div class=\"pill " + (has(variables.mongoDiskStatus) && variables.mongoDiskStatus == "ok" ? "ok" : "warn") + "\"><div class=\"label\">Mongo Disk</div><div class=\"value small\">" + (has(variables.mongoDiskPct) ? variables.mongoDiskPct + "%" : "N/A") + "</div></div>" +
-            "<div class=\"pill\"><div class=\"label\">RS Set</div><div class=\"value small\">" + (has(variables.rsSet) ? variables.rsSet : "N/A") + "</div></div>" +
+            (expressions.showNdp ? "<div class=\"pill\"><div class=\"label\">NDP Services</div><div class=\"value\">" + variables.deploymentCount + "</div></div>" : "") +
+            (expressions.showNdp ? "<div class=\"pill\"><div class=\"label\">StatefulSets</div><div class=\"value\">" + variables.statefulsetCount + "</div></div>" : "") +
+            (expressions.showClusters ? "<div class=\"pill\"><div class=\"label\">Clusters</div><div class=\"value\">" + variables.clusterCount + "</div></div>" : "") +
+            (expressions.showNodes ? "<div class=\"pill " + (variables.notReadyCount == "0" ? "ok" : "err") + "\"><div class=\"label\">Nodes</div><div class=\"value\">" + variables.nodeCount + "</div></div>" : "") +
+            (expressions.showDeployments ? "<div class=\"pill " + (variables.unhealthyDeploymentCount == "0" ? "ok" : "err") + "\"><div class=\"label\">Unhealthy Deploys</div><div class=\"value\">" + variables.unhealthyDeploymentCount + "</div></div>" : "") +
+            (expressions.showPods ? "<div class=\"pill " + (variables.podFailedCount == "0" && variables.podPendingCount == "0" ? "ok" : "warn") + "\"><div class=\"label\">Pods Running</div><div class=\"value\">" + variables.podRunningCount + "</div></div>" : "") +
+            (expressions.showMongo ? "<div class=\"pill " + (has(variables.mongoDiskStatus) && variables.mongoDiskStatus == "ok" ? "ok" : "warn") + "\"><div class=\"label\">Mongo Disk</div><div class=\"value small\">" + (has(variables.mongoDiskPct) ? variables.mongoDiskPct + "%" : "N/A") + "</div></div>" : "") +
+            (expressions.showLogs ? "<div class=\"pill " + ((has(variables.mongoLogErrorCount) && variables.mongoLogErrorCount != "0") || (has(variables.kafkaLogErrorCount) && variables.kafkaLogErrorCount != "0") ? "err" : "ok") + "\"><div class=\"label\">Log Errors</div><div class=\"value\">" + (has(variables.mongoLogErrorCount) ? variables.mongoLogErrorCount : "0") + " / " + (has(variables.kafkaLogErrorCount) ? variables.kafkaLogErrorCount : "0") + "</div></div>" : "") +
             "</div>" +
 
-            "<div class=\"section\"><div class=\"section-title\">NDP Service Versions<span class=\"source-tag\">kubectl &middot; ns: " + inputs.namespace + "</span></div>" +
-            "<div class=\"table-wrap\"><table><thead><tr><th>Service</th><th>Kind</th><th>Version</th><th>Image Repository</th></tr></thead><tbody>" +
-            expressions.svcTableRows +
-            "</tbody></table></div></div>" +
+            (expressions.showNdp ?
+              "<div class=\"section\"><div class=\"section-title\">NDP Service Versions<span class=\"source-tag\">kubectl · ns: " + inputs.namespace + "</span></div>" +
+              "<div class=\"table-wrap\"><table><thead><tr><th>Service</th><th>Kind</th><th>Version</th><th>Image Repository</th></tr></thead><tbody>" +
+              expressions.svcTableRows + "</tbody></table></div></div>"
+            : "") +
 
-            "<div class=\"section\"><div class=\"section-title\">Cluster &amp; Nirmata Kube Controller Versions<span class=\"source-tag\">MongoDB</span></div>" +
-            "<div class=\"table-wrap\"><table><thead><tr><th>Cluster Name</th><th>Kubernetes Version</th><th>NKC Version</th><th>State</th></tr></thead><tbody>" +
-            expressions.clusterTableRows +
-            "</tbody></table></div></div>" +
+            (expressions.showClusters ?
+              "<div class=\"section\"><div class=\"section-title\">Cluster &amp; NKC Versions<span class=\"source-tag\">MongoDB</span></div>" +
+              "<div class=\"table-wrap\"><table><thead><tr><th>Cluster Name</th><th>Kubernetes Version</th><th>NKC Version</th><th>State</th></tr></thead><tbody>" +
+              expressions.clusterTableRows + "</tbody></table></div></div>"
+            : "") +
 
-            "<div class=\"section\"><div class=\"section-title\">Node Health<span class=\"source-tag\">K8s API &middot; " + variables.nodeCount + " nodes</span></div>" +
-            "<div class=\"table-wrap\"><table><thead><tr><th>Node</th><th>Status</th><th>Schedulable</th><th>Kubelet Version</th></tr></thead><tbody>" +
-            expressions.nodeTableRows +
-            "</tbody></table></div></div>" +
+            (expressions.showNodes ?
+              "<div class=\"section\"><div class=\"section-title\">Node Health<span class=\"source-tag\">K8s API · " + variables.nodeCount + " nodes</span></div>" +
+              "<div class=\"table-wrap\"><table><thead><tr><th>Node</th><th>Status</th><th>Schedulable</th><th>Kubelet Version</th></tr></thead><tbody>" +
+              expressions.nodeTableRows + "</tbody></table></div></div>"
+            : "") +
 
-            "<div class=\"section\"><div class=\"section-title\">Deployment Health<span class=\"source-tag\">ns: " + inputs.namespace + "</span></div>" +
-            "<div class=\"table-wrap\"><table><thead><tr><th>Deployment</th><th>Desired</th><th>Ready</th><th>Status</th></tr></thead><tbody>" +
-            expressions.deploymentHealthTableRows +
-            "</tbody></table></div></div>" +
+            (expressions.showDeployments ?
+              "<div class=\"section\"><div class=\"section-title\">Deployment Health<span class=\"source-tag\">ns: " + inputs.namespace + "</span></div>" +
+              "<div class=\"table-wrap\"><table><thead><tr><th>Deployment</th><th>Desired</th><th>Ready</th><th>Status</th></tr></thead><tbody>" +
+              expressions.deploymentHealthTableRows + "</tbody></table></div></div>"
+            : "") +
 
-            "<div class=\"section\"><div class=\"section-title\">Pod Health<span class=\"source-tag\">Running: " + variables.podRunningCount + " &nbsp;·&nbsp; Pending: " + variables.podPendingCount + " &nbsp;·&nbsp; Failed: " + variables.podFailedCount + "</span></div>" +
-            "<div class=\"table-wrap\"><table><thead><tr><th>Pod Name</th><th>Phase</th></tr></thead><tbody>" +
-            expressions.podIssueTableRows +
-            "</tbody></table></div></div>" +
+            (expressions.showPods ?
+              "<div class=\"section\"><div class=\"section-title\">Pod Health<span class=\"source-tag\">Running: " + variables.podRunningCount + " · Pending: " + variables.podPendingCount + " · Failed: " + variables.podFailedCount + "</span></div>" +
+              "<div class=\"table-wrap\"><table><thead><tr><th>Pod Name</th><th>Phase</th></tr></thead><tbody>" +
+              expressions.podIssueTableRows + "</tbody></table></div></div>"
+            : "") +
 
-            "<div class=\"section\"><div class=\"section-title\">MongoDB Replica Set Status<span class=\"source-tag\">RS: " + (has(variables.rsSet) ? variables.rsSet : "N/A") + "</span></div>" +
-            "<div class=\"table-wrap\"><table><thead><tr><th>Member</th><th>Role</th><th>Health</th><th>Uptime</th><th>Ping</th></tr></thead><tbody>" +
-            expressions.rsTableRows +
-            "</tbody></table></div></div>" +
+            (expressions.showRs ?
+              "<div class=\"section\"><div class=\"section-title\">MongoDB Replica Set<span class=\"source-tag\">RS: " + (has(variables.rsSet) ? variables.rsSet : "N/A") + "</span></div>" +
+              "<div class=\"table-wrap\"><table><thead><tr><th>Member</th><th>Role</th><th>Health</th><th>Uptime</th><th>Ping</th></tr></thead><tbody>" +
+              expressions.rsTableRows + "</tbody></table></div></div>"
+            : "") +
 
-            "<div class=\"section\"><div class=\"section-title\">MongoDB Disk Health<span class=\"source-tag\">kubectl exec</span></div>" +
-            "<div class=\"table-wrap\"><table><thead><tr><th>Metric</th><th>Value</th><th>Status</th></tr></thead><tbody>" +
-            "<tr><td>Data Directory Usage (/data/db)</td><td>" + expressions.mongoDiskBar + "</td>" +
-            "<td><span class=\"state state-" + (has(variables.mongoDiskStatus) ? variables.mongoDiskStatus : "unknown") + "\">" +
-            (has(variables.mongoDiskStatus) && variables.mongoDiskStatus == "ok" ? "OK" : has(variables.mongoDiskStatus) && variables.mongoDiskStatus == "warning" ? "Warning" : has(variables.mongoDiskStatus) && variables.mongoDiskStatus == "critical" ? "Critical" : "Unknown") +
-            "</span></td></tr>" +
-            "<tr><td>WiredTiger Lookaside File (WiredTigerHS.wt)</td><td><code>" + (has(variables.mongoWiredtigerSize) ? variables.mongoWiredtigerSize : "N/A") + "</code></td>" +
-            "<td><span class=\"state state-" + (has(variables.mongoWiredtigerWarn) && variables.mongoWiredtigerWarn == "true" ? "warn" : "ok") + "\">" +
-            (has(variables.mongoWiredtigerWarn) && variables.mongoWiredtigerWarn == "true" ? "Large — check memory" : "OK") +
-            "</span></td></tr>" +
-            "</tbody></table></div></div>" +
+            (expressions.showMongo ?
+              "<div class=\"section\"><div class=\"section-title\">MongoDB Disk Health<span class=\"source-tag\">kubectl exec</span></div>" +
+              "<div class=\"table-wrap\"><table><thead><tr><th>Metric</th><th>Value</th><th>Status</th></tr></thead><tbody>" +
+              "<tr><td>Data Directory (/data/db)</td><td>" + expressions.mongoDiskBar + "</td><td><span class=\"state state-" + (has(variables.mongoDiskStatus) ? variables.mongoDiskStatus : "unknown") + "\">" + (has(variables.mongoDiskStatus) && variables.mongoDiskStatus == "ok" ? "OK" : has(variables.mongoDiskStatus) && variables.mongoDiskStatus == "warning" ? "Warning" : has(variables.mongoDiskStatus) && variables.mongoDiskStatus == "critical" ? "Critical" : "Unknown") + "</span></td></tr>" +
+              "<tr><td>WiredTiger Lookaside (WiredTigerHS.wt)</td><td><code>" + (has(variables.mongoWiredtigerSize) ? variables.mongoWiredtigerSize : "N/A") + "</code></td><td><span class=\"state state-" + (has(variables.mongoWiredtigerWarn) && variables.mongoWiredtigerWarn == "true" ? "warn" : "ok") + "\">" + (has(variables.mongoWiredtigerWarn) && variables.mongoWiredtigerWarn == "true" ? "Large — check memory" : "OK") + "</span></td></tr>" +
+              "</tbody></table></div></div>"
+            : "") +
 
-            "<div class=\"section\"><div class=\"section-title\">Kafka &amp; Kafka Controller Health<span class=\"source-tag\">Pods: " + (has(variables.kafkaPodCount) ? variables.kafkaPodCount : "0") + " &nbsp;·&nbsp; Controllers: " + (has(variables.kafkaControllerCount) ? variables.kafkaControllerCount : "0") + "</span></div>" +
-            "<div class=\"table-wrap\"><table><thead><tr><th>Pod</th><th>Type</th><th>Disk Usage</th><th>Status</th></tr></thead><tbody>" +
-            expressions.kafkaTableRows +
-            "</tbody></table></div></div>" +
+            (expressions.showKafka ?
+              "<div class=\"section\"><div class=\"section-title\">Kafka &amp; Controller Health<span class=\"source-tag\">Pods: " + (has(variables.kafkaPodCount) ? variables.kafkaPodCount : "0") + " · Controllers: " + (has(variables.kafkaControllerCount) ? variables.kafkaControllerCount : "0") + "</span></div>" +
+              "<div class=\"table-wrap\"><table><thead><tr><th>Pod</th><th>Type</th><th>Disk Usage</th><th>Status</th></tr></thead><tbody>" +
+              expressions.kafkaTableRows + "</tbody></table></div></div>"
+            : "") +
 
-            "<div class=\"footer\">Nirmata Version &amp; Health Report &nbsp;&middot;&nbsp; " + inputs.nirmataUrl + "</div>" +
+            (expressions.showLogs ?
+              "<div class=\"section\"><div class=\"section-title\">MongoDB Log Errors (last 1h)<span class=\"source-tag\">" + (has(variables.mongoLogErrorCount) ? variables.mongoLogErrorCount : "0") + " errors</span></div>" +
+              "<div class=\"table-wrap\"><table><thead><tr><th>Log Line</th></tr></thead><tbody>" +
+              (has(variables.mongoLogErrorRows) ? variables.mongoLogErrorRows : "<tr><td class=\"empty\">No data</td></tr>") +
+              "</tbody></table></div></div>" +
+              "<div class=\"section\"><div class=\"section-title\">Kafka Log Errors (last 1h)<span class=\"source-tag\">" + (has(variables.kafkaLogErrorCount) ? variables.kafkaLogErrorCount : "0") + " errors</span></div>" +
+              "<div class=\"table-wrap\"><table><thead><tr><th>Log Line</th></tr></thead><tbody>" +
+              (has(variables.kafkaLogErrorRows) ? variables.kafkaLogErrorRows : "<tr><td class=\"empty\">No data</td></tr>") +
+              "</tbody></table></div></div>"
+            : "") +
+
+            "<div class=\"footer\">Nirmata Version &amp; Health Report · " + inputs.nirmataUrl + "</div>" +
             "</div></body></html>"
 
       outputs:
         - name: htmlReport
           expression: 'expressions.html'
+
+    # ── Step 12: Slack alert (production-nch) — only when unhealthy ────────────
+    - name: sendSlackAlert
+      message: "Send Slack alert to production-nch"
+      failurePolicy: Continue
+      dependsOn:
+        - getNodeHealth
+        - getDeploymentHealth
+        - getPodHealth
+        - getMongoHealth
+        - getMongoLogs
+        - getKafkaLogs
+      matchConditions:
+        - name: slack-enabled
+          expression: 'inputs.slackWebhookUrl != ""'
+        - name: has-issues
+          expression: >-
+            variables.notReadyCount != "0" ||
+            variables.unhealthyDeploymentCount != "0" ||
+            variables.podFailedCount != "0" ||
+            (has(variables.mongoDiskStatus) && (variables.mongoDiskStatus == "critical" || variables.mongoDiskStatus == "warning")) ||
+            (has(variables.mongoLogErrorCount) && variables.mongoLogErrorCount != "0") ||
+            (has(variables.kafkaLogErrorCount) && variables.kafkaLogErrorCount != "0") ||
+            (has(variables.rsUnhealthyCount) && variables.rsUnhealthyCount != "0")
+      expressions:
+        - name: alertText
+          expression: >-
+            ":rotating_light: *Nirmata Health Alert* — `" + inputs.nirmataUrl + "` (ns: `" + inputs.namespace + "`)\n" +
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n" +
+            (variables.notReadyCount != "0" ? ":x: Nodes not ready: *" + variables.notReadyCount + "*\n" : "") +
+            (variables.cordonedCount != "0" ? ":warning: Nodes cordoned: *" + variables.cordonedCount + "*\n" : "") +
+            (variables.unhealthyDeploymentCount != "0" ? ":x: Deployments degraded: *" + variables.unhealthyDeploymentCount + "*\n" : "") +
+            (variables.podFailedCount != "0" ? ":x: Failed pods: *" + variables.podFailedCount + "*\n" : "") +
+            (variables.podPendingCount != "0" ? ":warning: Pending pods: *" + variables.podPendingCount + "*\n" : "") +
+            (has(variables.mongoDiskStatus) && variables.mongoDiskStatus == "critical" ? ":x: MongoDB disk CRITICAL: *" + variables.mongoDiskPct + "%*\n" : "") +
+            (has(variables.mongoDiskStatus) && variables.mongoDiskStatus == "warning" ? ":warning: MongoDB disk warning: *" + variables.mongoDiskPct + "%*\n" : "") +
+            (has(variables.mongoWiredtigerWarn) && variables.mongoWiredtigerWarn == "true" ? ":warning: MongoDB WiredTiger file large: *" + variables.mongoWiredtigerSize + "*\n" : "") +
+            (has(variables.rsUnhealthyCount) && variables.rsUnhealthyCount != "0" ? ":x: MongoDB RS unhealthy members: *" + variables.rsUnhealthyCount + "*\n" : "") +
+            (has(variables.mongoLogErrorCount) && variables.mongoLogErrorCount != "0" ? ":warning: MongoDB log errors (1h): *" + variables.mongoLogErrorCount + "*\n" : "") +
+            (has(variables.kafkaLogErrorCount) && variables.kafkaLogErrorCount != "0" ? ":warning: Kafka log errors (1h): *" + variables.kafkaLogErrorCount + "*\n" : "") +
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n" +
+            "_Run `bash run-report.sh` for the full HTML report._"
+        - name: slackPayload
+          expression: >-
+            http.post(
+              inputs.slackWebhookUrl,
+              {"text": expressions.alertText},
+              {"Content-Type": "application/json"}
+            )
+      outputs:
+        - name: slackAlertSent
+          expression: '"true"'
 
   # ── Workflow outputs ────────────────────────────────────────────────────────
   outputs:
@@ -536,9 +684,9 @@ spec:
       expression: 'variables.nodeCount'
     - name: unhealthyDeployments
       expression: 'variables.unhealthyDeploymentCount'
-    - name: ndpServices
-      expression: 'variables.ndpServices'
-    - name: clusters
-      expression: 'variables.clusters'
+    - name: mongoLogErrors
+      expression: 'has(variables.mongoLogErrorCount) ? variables.mongoLogErrorCount : "0"'
+    - name: kafkaLogErrors
+      expression: 'has(variables.kafkaLogErrorCount) ? variables.kafkaLogErrorCount : "0"'
     - name: htmlReport
       expression: 'variables.htmlReport'
