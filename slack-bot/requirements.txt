@@ -1,0 +1,4 @@
+slack-bolt>=1.18.0
+flask>=3.0.0
+requests>=2.31.0
+pyyaml>=6.0.1
